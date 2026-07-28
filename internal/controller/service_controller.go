@@ -3,13 +3,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -19,14 +20,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/utils/ptr"
-
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
@@ -34,326 +33,384 @@ const (
 	AnnoHostedCluster = "reflector.bizcochillo.io/hosted-cluster"
 	AnnoTargetService = "reflector.bizcochillo.io/target-service"
 	AnnoMode          = "reflector.bizcochillo.io/mode"
+
+	ModeNodes = "nodes" // Default: Pure Reflector mode (targets all worker nodes)
+	ModePods  = "pods"  // Target strictly worker nodes hosting active/ready pods
 )
+
+// RemoteClientBuilderFunc defines the signature for client builder dependency injection
+type RemoteClientBuilderFunc func(kubeconfigBytes []byte) (kubernetes.Interface, error)
 
 // ServiceReconciler reconciles a Service object in the Hub
 type ServiceReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme              *runtime.Scheme
+	RemoteClientBuilder RemoteClientBuilderFunc
 
-	// Connection Manager to avoid memory leaks and multiple watchers
-	mu          sync.Mutex
-	Connections map[string]context.CancelFunc
-
-	// Channel to receive dynamic events from the Hosted Clusters
+	mu             sync.Mutex
+	Connections    map[string]context.CancelFunc
 	TriggerChannel chan event.GenericEvent
-
-	RemoteClientBuilder func(kubeconfigBytes []byte) (kubernetes.Interface, error)
 }
 
-// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=services/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=core,resources=services/finalizers,verbs=update;patch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// 1. Fetch the Hub Headless Service
+	// 1. Fetch the Hub Service
 	hubSvc := &corev1.Service{}
-	err := r.Get(ctx, req.NamespacedName, hubSvc)
-	if err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	// 2. Extract configuration from Annotations
-	hcAnno := hubSvc.Annotations[AnnoHostedCluster]
-	targetSvcAnno := hubSvc.Annotations[AnnoTargetService]
-
-	hcParts := strings.Split(hcAnno, "/")
-	if len(hcParts) != 2 {
-		return ctrl.Result{}, nil
-	}
-	hcNamespace, hcName := hcParts[0], hcParts[1]
-
-	targetSvcParts := strings.Split(targetSvcAnno, "/")
-	if len(targetSvcParts) != 2 {
-		return ctrl.Result{}, nil
-	}
-	targetNs, targetName := targetSvcParts[0], targetSvcParts[1]
-
-	// 3. Locate the Kubeconfig Secret in the Hub
-	secretName := fmt.Sprintf("%s-admin-kubeconfig", hcName)
-	secret := &corev1.Secret{}
-
-	err = r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: hcNamespace}, secret)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			logger.Info("Kubeconfig secret not found yet, requeuing...", "Secret", secretName)
-			return ctrl.Result{RequeueAfter: time.Second * 10}, nil
+	if err := r.Get(ctx, req.NamespacedName, hubSvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	// 4. Build the connection to the Hosted Cluster
-	// 4. Build the connection to the Hosted Cluster using the injected builder
-	var hostedClient kubernetes.Interface
-	if r.RemoteClientBuilder != nil {
-		hostedClient, err = r.RemoteClientBuilder(secret.Data["kubeconfig"])
-	} else {
-		// Fallback to default behavior if not set
-		hostedRESTConfig, err := clientcmd.RESTConfigFromKubeConfig(secret.Data["kubeconfig"])
-		if err != nil {
+	// 2. Validate Annotations
+	clusterRef, hasCluster := hubSvc.Annotations[AnnoHostedCluster]
+	targetRef, hasTarget := hubSvc.Annotations[AnnoTargetService]
+
+	if !hasCluster || !hasTarget {
+		return ctrl.Result{}, nil
+	}
+
+	clusterParts := strings.Split(clusterRef, "/")
+	targetParts := strings.Split(targetRef, "/")
+
+	if len(clusterParts) != 2 || len(targetParts) != 2 {
+		logger.Error(fmt.Errorf("invalid annotation format"), "Annotations must be namespace/name")
+		return ctrl.Result{}, nil
+	}
+
+	clusterNamespace, clusterName := clusterParts[0], clusterParts[1]
+	targetNamespace, targetServiceName := targetParts[0], targetParts[1]
+
+	// Parse routing mode (defaults to ModeNodes)
+	mode := hubSvc.Annotations[AnnoMode]
+	if mode != ModePods {
+		mode = ModeNodes
+	}
+
+	// 3. Obtain Guest Cluster Client
+	hostedClient, err := r.getHostedClient(ctx, clusterNamespace, clusterName)
+	if err != nil {
+		logger.Error(err, "Failed to build client for Hosted Cluster", "Cluster", clusterName)
+		return ctrl.Result{}, err
+	}
+
+	// 4. Ensure Dynamic Watcher is Active for this Cluster
+	r.ensureWatcher(ctx, clusterName, hostedClient)
+
+	// 5. Fetch Remote NodePort Service to align Ports
+	remoteSvc, err := hostedClient.CoreV1().Services(targetNamespace).Get(ctx, targetServiceName, metav1.GetOptions{})
+	var targetNodePort int32 = 0
+
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "Failed to get target service in Hosted Cluster")
 			return ctrl.Result{}, err
 		}
-		hostedClient, err = kubernetes.NewForConfig(hostedRESTConfig)
-	}
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 5. Connection Manager: Start Informer if it doesn't exist
-	r.mu.Lock()
-	_, exists := r.Connections[hcName]
-	r.mu.Unlock()
-
-	if !exists {
-		ctxWatcher, cancel := context.WithCancel(context.Background())
-		r.mu.Lock()
-		r.Connections[hcName] = cancel
-		r.mu.Unlock()
-
-		logger.Info("🚀 Starting dynamic Informer for Hosted Cluster", "Cluster", hcName)
-		go r.startHostedClusterWatcher(ctxWatcher, hostedClient, hcName, hcNamespace)
+		logger.Info("⚠️ Remote service not found in Hosted Cluster", "Target", targetServiceName)
+	} else if len(remoteSvc.Spec.Ports) > 0 {
+		targetNodePort = remoteSvc.Spec.Ports[0].NodePort
 	}
 
-	// 6. Fetch the target Service to get the NodePort
-	targetSvc, err := hostedClient.CoreV1().Services(targetNs).Get(ctx, targetName, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			logger.Info("Target service not found in Hosted Cluster yet, requeuing...")
-			return ctrl.Result{RequeueAfter: time.Second * 10}, nil
+	// 6. Sync Hub Service TargetPort if NodePort changed
+	if targetNodePort != 0 && (len(hubSvc.Spec.Ports) == 0 || hubSvc.Spec.Ports[0].TargetPort.IntVal != targetNodePort) {
+		logger.Info("Updating Hub Service targetPort", "NewPort", targetNodePort)
+		if len(hubSvc.Spec.Ports) == 0 {
+			hubSvc.Spec.Ports = []corev1.ServicePort{{Name: "http", Port: 80}}
 		}
-		return ctrl.Result{}, err
-	}
-
-	var actualNodePort int32
-	for _, port := range targetSvc.Spec.Ports {
-		if port.NodePort > 0 {
-			actualNodePort = port.NodePort
-			break
-		}
-	}
-
-	if actualNodePort == 0 {
-		logger.Info("Target service exists but has no NodePort assigned. Requeuing...")
-		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
-	}
-
-	// 7. Sync Hub Service targetPort to match the actual NodePort
-	if len(hubSvc.Spec.Ports) > 0 && hubSvc.Spec.Ports[0].TargetPort.IntVal != actualNodePort {
-		logger.Info("Updating Hub Service targetPort", "NewPort", actualNodePort)
-		hubSvc.Spec.Ports[0].TargetPort = intstr.FromInt(int(actualNodePort))
+		hubSvc.Spec.Ports[0].TargetPort = intstr.FromInt32(targetNodePort)
 		if err := r.Update(ctx, hubSvc); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Return and let the update event trigger the next reconcile
 		return ctrl.Result{}, nil
 	}
 
-	// 8. ACTIVE NODE DETECTION LOGIC
-	logger.Info("Discovering active nodes hosting the remote service pods...")
-	labelSelector := fmt.Sprintf("kubernetes.io/service-name=%s", targetName)
-	remoteSlices, err := hostedClient.DiscoveryV1().EndpointSlices(targetNs).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
+	// 7. Discover Active Nodes based on configured Mode ("nodes" vs "pods")
+	logger.Info("Discovering active nodes for remote service...", "Mode", mode)
+	activeNodeIPs, err := r.getActiveNodeIPs(ctx, hostedClient, targetNamespace, targetServiceName, mode)
 	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Collect UNIQUE node names that have Ready pods
-	activeNodeNames := make(map[string]bool)
-	for _, slice := range remoteSlices.Items {
-		for _, ep := range slice.Endpoints {
-			// Skip pods that are not ready
-			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-				continue
-			}
-			if ep.NodeName != nil && *ep.NodeName != "" {
-				activeNodeNames[*ep.NodeName] = true
-			}
+		if apierrors.IsNotFound(err) {
+			logger.Info("⚠️ Remote endpoints/service missing in Hosted Cluster, clearing Hub EndpointSlice")
+			activeNodeIPs = []string{}
+		} else {
+			logger.Error(err, "Failed to discover active nodes")
+			return ctrl.Result{}, err
 		}
 	}
 
-	// 9. Fetch IPs for the active nodes only
-	var hubEndpoints []discoveryv1.Endpoint
-	for nodeName := range activeNodeNames {
-		node, err := hostedClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-		if err != nil {
-			logger.Error(err, "Failed to fetch node details", "NodeName", nodeName)
-			continue
-		}
-
-		var nodeIP string
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == corev1.NodeInternalIP {
-				nodeIP = addr.Address
-				break
-			}
-		}
-
-		if nodeIP != "" {
-			hubEndpoints = append(hubEndpoints, discoveryv1.Endpoint{
-				Addresses: []string{nodeIP},
-				NodeName:  ptr.To(nodeName),
-			})
-		}
-	}
-
-	// 10. Create or Update EndpointSlice in the Hub
+	// 8. Construct expected Hub EndpointSlice
+	sliceName := fmt.Sprintf("%s-shadow", hubSvc.Name)
 	expectedSlice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-shadow", hubSvc.Name),
+			Name:      sliceName,
 			Namespace: hubSvc.Namespace,
+			Labels: map[string]string{
+				"kubernetes.io/service-name":             hubSvc.Name,
+				"endpointslice.kubernetes.io/managed-by": "hcp-nodeport-reflector",
+			},
 		},
+		AddressType: discoveryv1.AddressTypeIPv4,
 	}
 
-	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, expectedSlice, func() error {
-		if err := controllerutil.SetControllerReference(hubSvc, expectedSlice, r.Scheme); err != nil {
-			return err
-		}
-
-		if expectedSlice.Labels == nil {
-			expectedSlice.Labels = make(map[string]string)
-		}
-		expectedSlice.Labels["kubernetes.io/service-name"] = hubSvc.Name
-		expectedSlice.AddressType = discoveryv1.AddressTypeIPv4
-
-		// EndpointSlice port must match the NodePort of the hosted cluster
-		expectedSlice.Ports = []discoveryv1.EndpointPort{{
-			Name: &hubSvc.Spec.Ports[0].Name,
-			Port: ptr.To[int32](actualNodePort),
-		}}
-
-		expectedSlice.Endpoints = hubEndpoints
-		return nil
-	})
-
-	if err != nil {
-		logger.Error(err, "Failed to reconcile EndpointSlice")
+	// Set OwnerReference for Automatic Garbage Collection
+	if err := controllerutil.SetControllerReference(hubSvc, expectedSlice, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if op != controllerutil.OperationResultNone {
-		logger.Info("✅ EndpointSlice synced!", "Operation", string(op), "ActiveNodes", len(hubEndpoints))
+	// Populate Ports
+	if targetNodePort != 0 {
+		expectedSlice.Ports = []discoveryv1.EndpointPort{
+			{
+				Name:     ptr.To("http"),
+				Port:     ptr.To(targetNodePort),
+				Protocol: ptr.To(corev1.ProtocolTCP),
+			},
+		}
+	}
+
+	// Populate Endpoints
+	if len(activeNodeIPs) > 0 {
+		expectedSlice.Endpoints = []discoveryv1.Endpoint{
+			{
+				Addresses: activeNodeIPs,
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: ptr.To(true),
+				},
+			},
+		}
+	} else {
+		expectedSlice.Endpoints = []discoveryv1.Endpoint{}
+	}
+
+	// 9. Mutate or Create EndpointSlice in Hub (with No-Op change detection)
+	existingSlice := &discoveryv1.EndpointSlice{}
+	err = r.Get(ctx, types.NamespacedName{Name: sliceName, Namespace: hubSvc.Namespace}, existingSlice)
+
+	if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, expectedSlice); err != nil {
+			return ctrl.Result{}, err
+		}
+		logger.Info("✅ EndpointSlice synced!", "Operation", "created", "ActiveNodes", len(activeNodeIPs), "Mode", mode)
+	} else if err == nil {
+		// PREVENCIÓN DE BUCLE: Solo actualizamos si hay cambios reales en la especificación
+		if !reflect.DeepEqual(existingSlice.Endpoints, expectedSlice.Endpoints) ||
+			!reflect.DeepEqual(existingSlice.Ports, expectedSlice.Ports) ||
+			!reflect.DeepEqual(existingSlice.Labels, expectedSlice.Labels) {
+
+			existingSlice.Endpoints = expectedSlice.Endpoints
+			existingSlice.Ports = expectedSlice.Ports
+			existingSlice.Labels = expectedSlice.Labels
+
+			if err := r.Update(ctx, existingSlice); err != nil {
+				return ctrl.Result{}, err
+			}
+			logger.Info("✅ EndpointSlice synced!", "Operation", "updated", "ActiveNodes", len(activeNodeIPs), "Mode", mode)
+		}
+	} else {
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// startHostedClusterWatcher starts informers for Services, Nodes, and EndpointSlices in the guest cluster
-func (r *ServiceReconciler) startHostedClusterWatcher(ctx context.Context, hostedClient kubernetes.Interface, hcName, hcNamespace string) {
-	factory := informers.NewSharedInformerFactory(hostedClient, time.Minute*10)
+// getActiveNodeIPs fetches Node IPs based on Mode:
+// - "nodes" (default): Reflects ALL active worker nodes directly (Pure Reflector).
+// - "pods": Filters strictly by worker nodes actively hosting ready pods.
+func (r *ServiceReconciler) getActiveNodeIPs(ctx context.Context, hostedClient kubernetes.Interface, namespace, serviceName, mode string) ([]string, error) {
+	podNodeMap := make(map[string]bool)
 
-	// Watch Services for NodePort changes
-	factory.Core().V1().Services().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { r.enqueueSpecificHubService(obj, hcName, hcNamespace) },
-		UpdateFunc: func(old, new interface{}) { r.enqueueSpecificHubService(new, hcName, hcNamespace) },
-		DeleteFunc: func(obj interface{}) { r.enqueueSpecificHubService(obj, hcName, hcNamespace) },
-	})
+	// In "pods" mode, we query EndpointSlices to filter down to specific host nodes
+	if mode == ModePods {
+		labelSelector := fmt.Sprintf("kubernetes.io/service-name=%s", serviceName)
+		slices, err := hostedClient.DiscoveryV1().EndpointSlices(namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+		if err != nil {
+			return nil, err
+		}
 
-	// Watch EndpointSlices for Pod scaling/scheduling changes
-	factory.Discovery().V1().EndpointSlices().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { r.enqueueSpecificHubService(obj, hcName, hcNamespace) },
-		UpdateFunc: func(old, new interface{}) { r.enqueueSpecificHubService(new, hcName, hcNamespace) },
-		DeleteFunc: func(obj interface{}) { r.enqueueSpecificHubService(obj, hcName, hcNamespace) },
-	})
+		for _, slice := range slices.Items {
+			for _, ep := range slice.Endpoints {
+				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+					if ep.NodeName != nil && *ep.NodeName != "" {
+						podNodeMap[*ep.NodeName] = true
+					}
+				}
+			}
+		}
 
-	// Watch Nodes for Node IP changes
-	factory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { r.enqueueAllHubServicesForCluster(hcName, hcNamespace) },
-		UpdateFunc: func(old, new interface{}) { r.enqueueAllHubServicesForCluster(hcName, hcNamespace) },
-		DeleteFunc: func(obj interface{}) { r.enqueueAllHubServicesForCluster(hcName, hcNamespace) },
-	})
+		// If mode is "pods" and no nodes host ready pods, return empty
+		if len(podNodeMap) == 0 {
+			return []string{}, nil
+		}
+	}
 
-	factory.Start(ctx.Done())
-	factory.WaitForCacheSync(ctx.Done())
+	// Fetch all cluster worker nodes
+	nodes, err := hostedClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
 
-	<-ctx.Done()
+	var nodeIPs []string
+	for _, node := range nodes.Items {
+		// Filter out Control-Plane / Master nodes
+		if isControlPlaneNode(node) {
+			continue
+		}
+
+		// In "pods" mode, skip nodes without ready pods
+		if mode == ModePods && !podNodeMap[node.Name] {
+			continue
+		}
+
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				nodeIPs = append(nodeIPs, addr.Address)
+				break
+			}
+		}
+	}
+
+	return nodeIPs, nil
 }
 
-// enqueueSpecificHubService wakes up the Hub Service associated with a specific Hosted Service event
-func (r *ServiceReconciler) enqueueSpecificHubService(obj interface{}, hcName, hcNamespace string) {
-	var remoteNs, remoteName string
+// isControlPlaneNode identifies control-plane/master nodes to exclude them
+func isControlPlaneNode(node corev1.Node) bool {
+	_, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]
+	_, isMaster := node.Labels["node-role.kubernetes.io/master"]
+	return isControlPlane || isMaster
+}
 
-	// Handle both Services and EndpointSlices
-	switch v := obj.(type) {
-	case *corev1.Service:
-		remoteNs = v.Namespace
-		remoteName = v.Name
-	case *discoveryv1.EndpointSlice:
-		remoteNs = v.Namespace
-		// Extract the actual service name from the EndpointSlice label
-		if svcName, ok := v.Labels["kubernetes.io/service-name"]; ok {
-			remoteName = svcName
-		} else {
-			return
-		}
-	default:
+// getHostedClient retrieves the admin kubeconfig Secret and builds the clientset
+func (r *ServiceReconciler) getHostedClient(ctx context.Context, namespace, clusterName string) (kubernetes.Interface, error) {
+	secretName := fmt.Sprintf("%s-admin-kubeconfig", clusterName)
+	secret := &corev1.Secret{}
+
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
+		return nil, fmt.Errorf("failed to find kubeconfig secret %s/%s: %w", namespace, secretName, err)
+	}
+
+	kubeconfigBytes, ok := secret.Data["kubeconfig"]
+	if !ok {
+		return nil, fmt.Errorf("secret %s/%s missing 'kubeconfig' key", namespace, secretName)
+	}
+
+	if r.RemoteClientBuilder != nil {
+		return r.RemoteClientBuilder(kubeconfigBytes)
+	}
+
+	clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeconfigBytes)
+	if err != nil {
+		return nil, fmt.Errorf("invalid kubeconfig bytes: %w", err)
+	}
+
+	restConfig, err := clientConfig.ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build REST config: %w", err)
+	}
+
+	return kubernetes.NewForConfig(restConfig)
+}
+
+// ensureWatcher sets up a dynamic Informer on the remote cluster to trigger Hub reconciliations
+func (r *ServiceReconciler) ensureWatcher(ctx context.Context, clusterName string, hostedClient kubernetes.Interface) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.Connections == nil {
+		r.Connections = make(map[string]context.CancelFunc)
+	}
+
+	if _, exists := r.Connections[clusterName]; exists {
 		return
 	}
 
-	expectedHcAnno := fmt.Sprintf("%s/%s", hcNamespace, hcName)
-	expectedTargetAnno := fmt.Sprintf("%s/%s", remoteNs, remoteName)
+	logger := log.FromContext(ctx)
+	logger.Info("🚀 Starting dynamic Informer for Hosted Cluster", "Cluster", clusterName)
 
-	var hubServices corev1.ServiceList
-	if err := r.List(context.Background(), &hubServices); err == nil {
-		for _, hubSvc := range hubServices.Items {
-			if hubSvc.Annotations[AnnoHostedCluster] == expectedHcAnno &&
-				hubSvc.Annotations[AnnoTargetService] == expectedTargetAnno {
-				r.TriggerChannel <- event.GenericEvent{Object: hubSvc.DeepCopy()}
+	watchCtx, cancel := context.WithCancel(context.Background())
+	r.Connections[clusterName] = cancel
+
+	factory := informers.NewSharedInformerFactory(hostedClient, 10*time.Minute)
+	endpointSliceInformer := factory.Discovery().V1().EndpointSlices().Informer()
+
+	extractServiceName := func(obj interface{}) string {
+		if slice, ok := obj.(*discoveryv1.EndpointSlice); ok {
+			return slice.Labels["kubernetes.io/service-name"]
+		}
+		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+			if slice, ok := tombstone.Obj.(*discoveryv1.EndpointSlice); ok {
+				return slice.Labels["kubernetes.io/service-name"]
 			}
+		}
+		return ""
+	}
+
+	handlerFuncs := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if svcName := extractServiceName(obj); svcName != "" {
+				r.triggerReconcile(clusterName)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if svcName := extractServiceName(newObj); svcName != "" {
+				r.triggerReconcile(clusterName)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			if svcName := extractServiceName(obj); svcName != "" {
+				r.triggerReconcile(clusterName)
+			}
+		},
+	}
+
+	_, _ = endpointSliceInformer.AddEventHandler(handlerFuncs)
+	factory.Start(watchCtx.Done())
+}
+
+// triggerReconcile queues an event into the controller-runtime channel
+func (r *ServiceReconciler) triggerReconcile(clusterName string) {
+	if r.TriggerChannel != nil {
+		r.TriggerChannel <- event.GenericEvent{
+			Object: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "trigger-" + clusterName,
+					Namespace: "default",
+				},
+			},
 		}
 	}
 }
 
-// enqueueAllHubServicesForCluster wakes up all Hub Services linked to a specific Hosted Cluster (useful for Node updates)
-func (r *ServiceReconciler) enqueueAllHubServicesForCluster(hcName, hcNamespace string) {
-	expectedHcAnno := fmt.Sprintf("%s/%s", hcNamespace, hcName)
-	var hubServices corev1.ServiceList
-	if err := r.List(context.Background(), &hubServices); err == nil {
-		for _, hubSvc := range hubServices.Items {
-			if hubSvc.Annotations[AnnoHostedCluster] == expectedHcAnno {
-				r.TriggerChannel <- event.GenericEvent{Object: hubSvc.DeepCopy()}
-			}
-		}
-	}
-}
-
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager registers the controller with the manager
 func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Connections = make(map[string]context.CancelFunc)
 	r.TriggerChannel = make(chan event.GenericEvent, 1024)
 
-	// Filter events to only reconcile Services with our specific annotation
-	annotationFilter := predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			_, ok := e.Object.GetAnnotations()[AnnoHostedCluster]
-			return ok
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			_, okNew := e.ObjectNew.GetAnnotations()[AnnoHostedCluster]
-			_, okOld := e.ObjectOld.GetAnnotations()[AnnoHostedCluster]
-			return okNew || okOld
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			_, ok := e.Object.GetAnnotations()[AnnoHostedCluster]
-			return ok
-		},
+	if r.RemoteClientBuilder == nil {
+		r.RemoteClientBuilder = func(kubeconfigBytes []byte) (kubernetes.Interface, error) {
+			clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeconfigBytes)
+			if err != nil {
+				return nil, err
+			}
+			restConfig, err := clientConfig.ClientConfig()
+			if err != nil {
+				return nil, err
+			}
+			return kubernetes.NewForConfig(restConfig)
+		}
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Service{}).
-		WithEventFilter(annotationFilter).
-		WatchesRawSource(source.Channel(r.TriggerChannel, &handler.EnqueueRequestForObject{})).
+		Owns(&discoveryv1.EndpointSlice{}).
+		WatchesRawSource(
+			source.Channel(r.TriggerChannel, &handler.EnqueueRequestForObject{}),
+		).
 		Complete(r)
 }

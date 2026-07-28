@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: my-app-shadow
+  name: my-app-shadow-dummy
   namespace: default
   annotations:
     reflector.bizcochillo.io/hosted-cluster: "clusters-hosted-mock/hosted-mock"
-    reflector.bizcochillo.io/target-service: "default/my-app-nodeport"
+    reflector.bizcochillo.io/target-service: "default/my-app-nodeport-dummy"
     reflector.bizcochillo.io/mode: "pods"
 spec:
   clusterIP: None
