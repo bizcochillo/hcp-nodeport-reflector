@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +35,8 @@ const (
 
 	ModeNodes = "nodes" // Default: Pure Reflector mode (targets all worker nodes)
 	ModePods  = "pods"  // Target strictly worker nodes hosting active/ready pods
+
+	PortNameHTTP = "http"
 )
 
 // RemoteClientBuilderFunc defines the signature for client builder dependency injection
@@ -95,7 +96,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		mode = ModeNodes
 	}
 
-	// 3. Obtain Guest Cluster Client
+	// 3. Obtain Guest Cluster Client (Supports Manual & ACM Locations)
 	hostedClient, err := r.getHostedClient(ctx, clusterNamespace, clusterName)
 	if err != nil {
 		logger.Error(err, "Failed to build client for Hosted Cluster", "Cluster", clusterName)
@@ -107,7 +108,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// 5. Fetch Remote NodePort Service to align Ports
 	remoteSvc, err := hostedClient.CoreV1().Services(targetNamespace).Get(ctx, targetServiceName, metav1.GetOptions{})
-	var targetNodePort int32 = 0
+	var targetNodePort int32
 
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -123,7 +124,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if targetNodePort != 0 && (len(hubSvc.Spec.Ports) == 0 || hubSvc.Spec.Ports[0].TargetPort.IntVal != targetNodePort) {
 		logger.Info("Updating Hub Service targetPort", "NewPort", targetNodePort)
 		if len(hubSvc.Spec.Ports) == 0 {
-			hubSvc.Spec.Ports = []corev1.ServicePort{{Name: "http", Port: 80}}
+			hubSvc.Spec.Ports = []corev1.ServicePort{{Name: PortNameHTTP, Port: 80}}
 		}
 		hubSvc.Spec.Ports[0].TargetPort = intstr.FromInt32(targetNodePort)
 		if err := r.Update(ctx, hubSvc); err != nil {
@@ -168,7 +169,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if targetNodePort != 0 {
 		expectedSlice.Ports = []discoveryv1.EndpointPort{
 			{
-				Name:     ptr.To("http"),
+				Name:     ptr.To(PortNameHTTP),
 				Port:     ptr.To(targetNodePort),
 				Protocol: ptr.To(corev1.ProtocolTCP),
 			},
@@ -189,7 +190,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		expectedSlice.Endpoints = []discoveryv1.Endpoint{}
 	}
 
-	// 9. Mutate or Create EndpointSlice in Hub (with No-Op change detection)
+	// 9. Mutate or Create EndpointSlice in Hub
 	existingSlice := &discoveryv1.EndpointSlice{}
 	err = r.Get(ctx, types.NamespacedName{Name: sliceName, Namespace: hubSvc.Namespace}, existingSlice)
 
@@ -199,20 +200,13 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		logger.Info("✅ EndpointSlice synced!", "Operation", "created", "ActiveNodes", len(activeNodeIPs), "Mode", mode)
 	} else if err == nil {
-		// PREVENCIÓN DE BUCLE: Solo actualizamos si hay cambios reales en la especificación
-		if !reflect.DeepEqual(existingSlice.Endpoints, expectedSlice.Endpoints) ||
-			!reflect.DeepEqual(existingSlice.Ports, expectedSlice.Ports) ||
-			!reflect.DeepEqual(existingSlice.Labels, expectedSlice.Labels) {
-
-			existingSlice.Endpoints = expectedSlice.Endpoints
-			existingSlice.Ports = expectedSlice.Ports
-			existingSlice.Labels = expectedSlice.Labels
-
-			if err := r.Update(ctx, existingSlice); err != nil {
-				return ctrl.Result{}, err
-			}
-			logger.Info("✅ EndpointSlice synced!", "Operation", "updated", "ActiveNodes", len(activeNodeIPs), "Mode", mode)
+		existingSlice.Endpoints = expectedSlice.Endpoints
+		existingSlice.Ports = expectedSlice.Ports
+		existingSlice.Labels = expectedSlice.Labels
+		if err := r.Update(ctx, existingSlice); err != nil {
+			return ctrl.Result{}, err
 		}
+		logger.Info("✅ EndpointSlice synced!", "Operation", "updated", "ActiveNodes", len(activeNodeIPs), "Mode", mode)
 	} else {
 		return ctrl.Result{}, err
 	}
@@ -286,18 +280,35 @@ func isControlPlaneNode(node corev1.Node) bool {
 	return isControlPlane || isMaster
 }
 
-// getHostedClient retrieves the admin kubeconfig Secret and builds the clientset
+// getHostedClient searches for kubeconfig secrets in standard & ACM locations
 func (r *ServiceReconciler) getHostedClient(ctx context.Context, namespace, clusterName string) (kubernetes.Interface, error) {
-	secretName := fmt.Sprintf("%s-admin-kubeconfig", clusterName)
-	secret := &corev1.Secret{}
+	candidates := []types.NamespacedName{
+		{Namespace: namespace, Name: fmt.Sprintf("%s-admin-kubeconfig", clusterName)},
+		{Namespace: namespace, Name: fmt.Sprintf("%s-cluster-secret", clusterName)},
+		{Namespace: fmt.Sprintf("clusters-%s", clusterName), Name: "admin-kubeconfig"},
+		{Namespace: clusterName, Name: "admin-kubeconfig"},
+	}
 
-	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
-		return nil, fmt.Errorf("failed to find kubeconfig secret %s/%s: %w", namespace, secretName, err)
+	var secret corev1.Secret
+	var found bool
+
+	for _, loc := range candidates {
+		if err := r.Get(ctx, loc, &secret); err == nil {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("failed to find kubeconfig secret for cluster %s in %s", clusterName, namespace)
 	}
 
 	kubeconfigBytes, ok := secret.Data["kubeconfig"]
 	if !ok {
-		return nil, fmt.Errorf("secret %s/%s missing 'kubeconfig' key", namespace, secretName)
+		kubeconfigBytes, ok = secret.Data["value"]
+	}
+	if !ok {
+		return nil, fmt.Errorf("secret %s/%s missing 'kubeconfig' or 'value' key", secret.Namespace, secret.Name)
 	}
 
 	if r.RemoteClientBuilder != nil {
@@ -339,33 +350,15 @@ func (r *ServiceReconciler) ensureWatcher(ctx context.Context, clusterName strin
 	factory := informers.NewSharedInformerFactory(hostedClient, 10*time.Minute)
 	endpointSliceInformer := factory.Discovery().V1().EndpointSlices().Informer()
 
-	extractServiceName := func(obj interface{}) string {
-		if slice, ok := obj.(*discoveryv1.EndpointSlice); ok {
-			return slice.Labels["kubernetes.io/service-name"]
-		}
-		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-			if slice, ok := tombstone.Obj.(*discoveryv1.EndpointSlice); ok {
-				return slice.Labels["kubernetes.io/service-name"]
-			}
-		}
-		return ""
-	}
-
 	handlerFuncs := cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if svcName := extractServiceName(obj); svcName != "" {
-				r.triggerReconcile(clusterName)
-			}
+		AddFunc: func(obj any) {
+			r.triggerReconcile(clusterName)
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			if svcName := extractServiceName(newObj); svcName != "" {
-				r.triggerReconcile(clusterName)
-			}
+		UpdateFunc: func(oldObj, newObj any) {
+			r.triggerReconcile(clusterName)
 		},
-		DeleteFunc: func(obj interface{}) {
-			if svcName := extractServiceName(obj); svcName != "" {
-				r.triggerReconcile(clusterName)
-			}
+		DeleteFunc: func(obj any) {
+			r.triggerReconcile(clusterName)
 		},
 	}
 
