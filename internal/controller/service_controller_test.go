@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -58,7 +59,7 @@ var _ = Describe("Service Controller - Multi-Cluster Reflector Suite", func() {
 				Spec: corev1.ServiceSpec{
 					Type: corev1.ServiceTypeNodePort,
 					Ports: []corev1.ServicePort{
-						{Name: "http", Port: 80, NodePort: TargetNodePort},
+						{Name: PortNameHTTP, Port: 80, NodePort: TargetNodePort},
 					},
 				},
 			},
@@ -115,7 +116,7 @@ var _ = Describe("Service Controller - Multi-Cluster Reflector Suite", func() {
 					},
 				},
 				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{{Name: "http", Port: 80}},
+					Ports: []corev1.ServicePort{{Name: PortNameHTTP, Port: 80}},
 				},
 			}
 			Expect(k8sClient.Create(ctx, hubService)).To(Succeed())
@@ -151,7 +152,7 @@ var _ = Describe("Service Controller - Multi-Cluster Reflector Suite", func() {
 					},
 				},
 				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{{Name: "http", Port: 80}},
+					Ports: []corev1.ServicePort{{Name: PortNameHTTP, Port: 80}},
 				},
 			}
 			Expect(k8sClient.Create(ctx, hubService)).To(Succeed())
@@ -178,7 +179,7 @@ var _ = Describe("Service Controller - Multi-Cluster Reflector Suite", func() {
 			hubService := &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: ServiceNamespace},
 				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{{Name: "http", Port: 80}},
+					Ports: []corev1.ServicePort{{Name: PortNameHTTP, Port: 80}},
 				},
 			}
 			Expect(k8sClient.Create(ctx, hubService)).To(Succeed())
@@ -186,7 +187,7 @@ var _ = Describe("Service Controller - Multi-Cluster Reflector Suite", func() {
 
 			result, err := reconciler.Reconcile(ctx, req)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.Requeue).To(BeFalse())
+			Expect(result).To(Equal(ctrl.Result{}))
 
 			// EndpointSlice must NOT exist for this service
 			slice := &discoveryv1.EndpointSlice{}
@@ -211,7 +212,7 @@ var _ = Describe("Service Controller - Multi-Cluster Reflector Suite", func() {
 					},
 				},
 				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{{Name: "http", Port: 80}},
+					Ports: []corev1.ServicePort{{Name: PortNameHTTP, Port: 80}},
 				},
 			}
 			Expect(k8sClient.Create(ctx, hubService)).To(Succeed())
@@ -240,7 +241,7 @@ var _ = Describe("Service Controller - Multi-Cluster Reflector Suite", func() {
 					},
 				},
 				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{{Name: "http", Port: 80}},
+					Ports: []corev1.ServicePort{{Name: PortNameHTTP, Port: 80}},
 				},
 			}
 			Expect(k8sClient.Create(ctx, hubService)).To(Succeed())
