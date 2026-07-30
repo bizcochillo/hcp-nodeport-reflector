@@ -75,6 +75,104 @@ reflect-my-backend  Synced   Cluster   2              89m
 ```
 You can now point any Hub Ingress/Route to the newly created shadow service (`reflect-my-backend`).
 
+### 3. Advanced: Ingress Chaining (Edge-to-Cluster Proxying)
+A powerful architectural pattern enabled by this operator is chaining Ingress controllers. You can route wildcard traffic from the Hub directly to an Ingress Controller running inside the Hosted Cluster.
+
+By leveraging `externalTrafficPolicy: Local` on the remote Ingress Service, the client's original IP is preserved across clusters without SNAT. Furthermore, by using an OpenShift `passthrough` Route in the Hub, the Hub router forwards the raw TCP/TLS stream based on SNI (Server Name Indication).
+
+This means: 
+- The `Host` header is never rewritten.
+- The Hosted Cluster handles TLS termination natively with its own certificates.
+
+**In the Hosted cluster**
+We create a service `router-nodeport` of NodePort type which will be monitored by the reflector to create the EndpointSlices. 
+
+```yaml
+kind: Service
+apiVersion: v1
+metadata:
+  name: router-nodeport
+  namespace: openshift-ingress
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 443
+  internalTrafficPolicy: Cluster
+  type: NodePort
+  selector:
+    ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default
+```
+
+**In the Hub cluster**
+
+We enable wildcard routes in the targeted Ingress controller of the Hub cluster 
+```bash
+oc patch ingresscontroller default -n openshift-ingress-operator \
+  --type=merge \
+  -p '{"spec": {"routeAdmission": {"wildcardPolicy": "WildcardsAllowed"}}}'
+```
+
+We create a NodePortReflector, that is monitoring the just created `NodePort` service named `router-nodeport` in the cluster `my-hosted-cluster-name`
+```yaml
+apiVersion: reflector.bizcochillo.io/v1alpha1
+kind: NodePortReflector
+metadata:
+  name: router-hosted
+  namespace: demo-reflectors
+spec:
+  hostedCluster:
+    name: my-hosted-cluster-name # The name of the HyperShift HostedCluster
+    namespace: clusters          # The namespace where the HostedCluster resides in the Hub
+  targetService:
+    name: router-nodeport
+    namespace: openshift-ingress
+```
+
+We create routes for HTTP and HTTPS 
+```yaml
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: router-hosted-http
+  namespace: demo-reflectors
+spec:
+  host: wildcard.apps2.hosted.hypershift.lab
+  path: /
+  to:
+    kind: Service
+    name: router-hosted
+    weight: 100
+  port:
+    targetPort: http
+  wildcardPolicy: Subdomain
+---
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: router-hosted-https
+  namespace: demo-reflectors
+spec:
+  host: wildcard.apps2.hosted.hypershift.lab
+  to:
+    kind: Service
+    name: router-hosted
+    weight: 100
+  port:
+    targetPort: https
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: None
+  wildcardPolicy: Subdomain
+```
+
+To use this approach, you must configure a wildcard DNS record (e.g., `*.apps2.hosted.hypershift.lab`) that resolves to the Management (Hub) cluster. Once configured, all HTTP and HTTPS traffic targeting this wildcard domain is received by the Hub's Ingress Controller and transparently forwarded to the default Ingress Controller running inside the Hosted cluster.
 
 ## Getting Started
 
