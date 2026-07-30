@@ -1,8 +1,79 @@
 # hcp-nodeport-reflector
-// TODO(user): Add simple overview of use/purpose
+A Kubernetes operator designed to seamlessly bridge network traffic from an OpenShift HyperShift (HCP) Management Cluster (Hub) directly to workloads running inside Hosted Clusters.
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+In a HyperShift architecture, worker nodes and workloads live in a Hosted Cluster, while the control plane lives in the Management (Hub) Cluster. Exposing Hosted Cluster applications usually requires provisioning external cloud load balancers. But what if you want to route traffic centrally through the Hub cluster's Ingress Controller or Gateway?
+
+The **HCP NodePort Reflector** solves this by creating a direct L4 network bridge. 
+
+When you deploy a `NodePortReflector` Custom Resource in the Hub cluster, the operator dynamically connects to the Hosted Cluster, inspects a target `NodePort` service, and automatically provisions a "Shadow Service" and an `EndpointSlice` in the Hub. This allows resources in the Hub (like a central HAProxy Router) to send traffic directly to the worker nodes of the Hosted Cluster.
+
+**Key Features:**
+*   **Zero-SNAT IP Preservation:** It intelligently reads the remote service's `externalTrafficPolicy`. If set to `Local`, the operator maps endpoints exclusively to the nodes actively running the pods, preserving the original client IP across cluster boundaries.
+*   **Multi-Port Sync:** Automatically discovers and reflects all exposed ports from the remote service.
+*   **Dynamic Synchronization:** Continuously monitors the Hosted Cluster to update the Hub's endpoints if worker nodes scale up/down or if the remote service changes.
+*   **Ingress Chaining:** Enables advanced multi-tier routing (e.g., exposing a Hosted Cluster's Ingress controller through the Hub's Ingress controller using Passthrough routes).
+
+---
+
+## Architecture & How it Works
+
+1. The Operator runs in the **Hub Cluster**.
+2. A user creates a `NodePortReflector` Custom Resource in the Hub.
+3. The controller locates the automatically generated `kubeconfig` secret for the specified Hosted Cluster.
+4. It connects to the Hosted Cluster and reads the target `NodePort` Service.
+5. It creates a **Shadow Service** (type `ClusterIP`) and a corresponding **EndpointSlice** in the Hub, mapping the Hub service directly to the IPs of the Hosted Cluster's worker nodes.
+
+---
+
+## Usage Example
+
+To reflect a service, you need to expose your application as a `NodePort` in the Hosted Cluster, and then create a `NodePortReflector` in the Hub Cluster.
+
+### 1. In your Hosted Cluster
+Deploy your application and expose it using a `NodePort` service. To preserve the client's original IP, use `externalTrafficPolicy: Local`.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-backend-app
+  namespace: default
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app: my-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+
+### 2. In your Hub Cluster
+Create the Custom Resource. The operator will automatically find the Hosted Cluster, locate `my-backend-app`, and create a shadow service in the Hub.
+
+```yaml
+apiVersion: reflector.bizcochillo.io/v1alpha1
+kind: NodePortReflector
+metadata:
+  name: reflect-my-backend
+  namespace: default
+spec:
+  hostedCluster:
+    name: my-hosted-cluster-name # The name of the HyperShift HostedCluster
+    namespace: clusters          # The namespace where the HostedCluster resides in the Hub
+  targetService:
+    name: my-backend-app         # The name of the Service inside the Hosted Cluster
+    namespace: default           # The namespace of the Service inside the Hosted Cluster
+```
+Once applied, you can verify the status:
+
+```bash
+[user@host ~]$ oc get nodeportreflector reflect-my-backend
+NAME                PHASE    POLICY    ACTIVE NODES   AGE
+reflect-my-backend  Synced   Cluster   2              89m
+```
+You can now point any Hub Ingress/Route to the newly created shadow service (`reflect-my-backend`).
+
 
 ## Getting Started
 
