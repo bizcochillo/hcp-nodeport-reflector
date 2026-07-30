@@ -1,0 +1,9 @@
+apiVersion: reflector.bizcochillo.io/v1alpha1
+kind: NodePortReflector
+metadata:
+  labels:
+    app.kubernetes.io/name: hcp-nodeport-reflector
+    app.kubernetes.io/managed-by: kustomize
+  name: nodeportreflector-sample
+spec:
+  # TODO(user): Add fields here

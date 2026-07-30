@@ -6,6 +6,7 @@ cliVersion: 4.15.0
 domain: bizcochillo.io
 layout:
 - go.kubebuilder.io/v4
+multigroup: true
 projectName: hcp-nodeport-reflector
 repo: github.com/bizcochillo/hcp-nodeport-reflector
 resources:
@@ -15,4 +16,13 @@ resources:
   kind: Service
   path: k8s.io/api/core/v1
   version: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: bizcochillo.io
+  group: reflector
+  kind: NodePortReflector
+  path: github.com/bizcochillo/hcp-nodeport-reflector/api/reflector/v1alpha1
+  version: v1alpha1
 version: "3"
