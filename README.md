@@ -47,6 +47,7 @@ spec:
   - name: http
     port: 80
     targetPort: 8080
+```
 
 ### 2. In your Hub Cluster
 Create the Custom Resource. The operator will automatically find the Hosted Cluster, locate `my-backend-app`, and create a shadow service in the Hub.
