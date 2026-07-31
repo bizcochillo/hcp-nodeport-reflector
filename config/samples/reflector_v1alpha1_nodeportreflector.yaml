@@ -6,4 +6,10 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: nodeportreflector-sample
 spec:
-  # TODO(user): Add fields here
+  headless: true # Uncomment to create a Headless Service (ClusterIP: None) without a VIP
+  hostedCluster:
+    name: my-cluster
+    namespace: clusters
+  targetService:
+    name: my-backend
+    namespace: default

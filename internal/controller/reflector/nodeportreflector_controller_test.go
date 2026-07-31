@@ -29,7 +29,7 @@ var _ = Describe("NodePortReflector Controller", func() {
 	)
 
 	BeforeEach(func() {
-		// 1. Setup Fake Remote Cluster con 2 Worker Nodes y 1 Master
+		// 1. Setup Fake Remote Cluster with 2 Worker Nodes and 1 Master
 		fakeClient = fake.NewSimpleClientset(
 			&corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "worker-1"},
@@ -46,19 +46,19 @@ var _ = Describe("NodePortReflector Controller", func() {
 				},
 				Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.99"}}},
 			},
-			// Remote Target Service (MULTIPLES PUERTOS)
+			// Remote Target Service (MULTIPLE PORTS)
 			&corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: TargetSvcName, Namespace: Namespace},
 				Spec: corev1.ServiceSpec{
 					Type:                  corev1.ServiceTypeNodePort,
-					ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyCluster, // Por defecto "Cluster" -> Mode: nodes
+					ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyCluster, // Default "Cluster" -> Mode: nodes
 					Ports: []corev1.ServicePort{
 						{Name: "http", Port: 80, NodePort: 30080, Protocol: corev1.ProtocolTCP},
 						{Name: "https", Port: 443, NodePort: 30443, Protocol: corev1.ProtocolTCP},
 					},
 				},
 			},
-			// Remote EndpointSlice (Pod ready solo en worker-1)
+			// Remote EndpointSlice (Pod ready only on worker-1)
 			&discoveryv1.EndpointSlice{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      TargetSvcName + "-slice",
@@ -114,14 +114,14 @@ var _ = Describe("NodePortReflector Controller", func() {
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
-		// Verificar que el Service del Hub tiene TODOS los puertos mapeados
+		// Verify the Hub Service has ALL ports mapped
 		hubSvc := &corev1.Service{}
 		err = k8sClient.Get(ctx, req.NamespacedName, hubSvc)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(hubSvc.Spec.Ports).To(HaveLen(2))
 		Expect(hubSvc.Spec.Ports[0].TargetPort.IntVal).To(Equal(int32(30080)))
 
-		// Verificar que el EndpointSlice contiene AMBOS worker nodes (porque es policy: Cluster)
+		// Verify the EndpointSlice contains BOTH worker nodes (due to policy: Cluster)
 		slice := &discoveryv1.EndpointSlice{}
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: crName + "-shadow", Namespace: Namespace}, slice)
 		Expect(err).NotTo(HaveOccurred())
@@ -131,7 +131,7 @@ var _ = Describe("NodePortReflector Controller", func() {
 	})
 
 	It("Should use 'pods' mode when ExternalTrafficPolicy is Local", func() {
-		// Modificamos el servicio remoto en el cliente fake a "Local"
+		// Change the remote service in the fake client to "Local"
 		remoteSvc, _ := fakeClient.CoreV1().Services(Namespace).Get(ctx, TargetSvcName, metav1.GetOptions{})
 		remoteSvc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 		_, _ = fakeClient.CoreV1().Services(Namespace).Update(ctx, remoteSvc, metav1.UpdateOptions{})
@@ -152,7 +152,7 @@ var _ = Describe("NodePortReflector Controller", func() {
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
-		// Verificar que el EndpointSlice SOLO contiene el worker-1 (porque es policy: Local)
+		// Verify the EndpointSlice ONLY contains worker-1 (due to policy: Local)
 		slice := &discoveryv1.EndpointSlice{}
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: crName + "-shadow", Namespace: Namespace}, slice)
 		Expect(err).NotTo(HaveOccurred())
@@ -173,20 +173,68 @@ var _ = Describe("NodePortReflector Controller", func() {
 		Expect(k8sClient.Create(ctx, npr)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, npr) }()
 
-		// Reconciliar estado inicial
+		// Reconcile initial state
 		_, _ = reconciler.Reconcile(ctx, req)
 
-		// Borramos el servicio remoto
+		// Delete the remote service
 		_ = fakeClient.CoreV1().Services(Namespace).Delete(ctx, TargetSvcName, metav1.DeleteOptions{})
 
-		// Reconciliar otra vez
+		// Reconcile again
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
-		// El EndpointSlice debe estar vacío
+		// The EndpointSlice must be empty
 		slice := &discoveryv1.EndpointSlice{}
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: crName + "-shadow", Namespace: Namespace}, slice)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(slice.Endpoints).To(BeEmpty())
+	})
+
+	It("Should delete and requeue the Hub Service when Headless flag changes to avoid immutability errors", func() {
+		crName := "npr-headless-toggle"
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: crName, Namespace: Namespace}}
+
+		npr := &reflectorv1alpha1.NodePortReflector{
+			ObjectMeta: metav1.ObjectMeta{Name: crName, Namespace: Namespace},
+			Spec: reflectorv1alpha1.NodePortReflectorSpec{
+				Headless:      false, // Initially, standard ClusterIP
+				HostedCluster: reflectorv1alpha1.NamespacedRef{Name: ClusterName, Namespace: Namespace},
+				TargetService: reflectorv1alpha1.NamespacedRef{Name: TargetSvcName, Namespace: Namespace},
+			},
+		}
+		Expect(k8sClient.Create(ctx, npr)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, npr) }()
+
+		// 1. Initial Reconcile (Headless: false)
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Validate it was created as a standard service
+		hubSvc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, req.NamespacedName, hubSvc)).To(Succeed())
+		Expect(hubSvc.Spec.ClusterIP).NotTo(Equal(corev1.ClusterIPNone))
+
+		// 2. Change Headless to true
+		Expect(k8sClient.Get(ctx, req.NamespacedName, npr)).To(Succeed())
+		npr.Spec.Headless = true
+		Expect(k8sClient.Update(ctx, npr)).To(Succeed())
+
+		// 3. Reconcile should detect the change, delete the service, and request a Requeue
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		// NOTE: This assertion WILL FAIL until you implement the delete/requeue logic in the controller!
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "Expected RequeueAfter to be set after deleting the immutable service")
+
+		// Simulate the asynchronous deletion
+		_ = k8sClient.Delete(ctx, hubSvc)
+
+		// 4. Simulate the requeue loop triggered by the controller
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		// 5. Verify the service is now recreated as Headless
+		Expect(k8sClient.Get(ctx, req.NamespacedName, hubSvc)).To(Succeed())
+		Expect(hubSvc.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
 	})
 })

@@ -93,7 +93,7 @@ func (r *NodePortReflectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if apierrors.IsNotFound(err) {
 			logger.Info("⚠️ Remote service not found, clearing Hub endpoints")
 
-			// Vaciamos explícitamente solo los Endpoints (mantenemos el Service intacto por seguridad)
+			// Explicitly clear only the Endpoints (keep the Service intact for safety)
 			sliceName := fmt.Sprintf("%s-shadow", npr.Name)
 			existingSlice := &discoveryv1.EndpointSlice{}
 			if getErr := r.Get(ctx, types.NamespacedName{Name: sliceName, Namespace: npr.Namespace}, existingSlice); getErr == nil {
@@ -123,8 +123,13 @@ func (r *NodePortReflectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	// 6. Sync Hub Resources
-	if err := r.syncHubResources(ctx, npr, remoteSvc.Spec.Ports, activeNodeIPs); err != nil {
+	requeue, err := r.syncHubResources(ctx, npr, remoteSvc.Spec.Ports, activeNodeIPs)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if requeue {
+		// Stop reconciliation here and let it run again to recreate the service cleanly
+		return ctrl.Result{RequeueAfter: 100 * time.Millisecond}, nil
 	}
 
 	// 7. Update Status
@@ -132,7 +137,35 @@ func (r *NodePortReflectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	return ctrl.Result{}, err
 }
 
-func (r *NodePortReflectorReconciler) syncHubResources(ctx context.Context, npr *reflectorv1alpha1.NodePortReflector, remotePorts []corev1.ServicePort, activeNodeIPs []string) error {
+func (r *NodePortReflectorReconciler) syncHubResources(ctx context.Context, npr *reflectorv1alpha1.NodePortReflector, remotePorts []corev1.ServicePort, activeNodeIPs []string) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	// --- HEADLESS IMMUTABILITY DETECTION ---
+	existingSvc := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: npr.Name, Namespace: npr.Namespace}, existingSvc)
+	if err == nil {
+		// Check if the current state matches the desired Headless state
+		isCurrentlyHeadless := existingSvc.Spec.ClusterIP == corev1.ClusterIPNone
+		wantsHeadless := npr.Spec.Headless
+
+		if isCurrentlyHeadless != wantsHeadless {
+			logger.Info("Detected change in Headless flag. Deleting immutable Service for recreation",
+				"Namespace", existingSvc.Namespace, "Name", existingSvc.Name)
+
+			// Delete the service that no longer matches the desired configuration
+			if delErr := r.Delete(ctx, existingSvc); delErr != nil {
+				logger.Error(delErr, "Failed to delete Service for recreation")
+				return false, delErr
+			}
+
+			// Return true to signal that the controller should Requeue
+			return true, nil
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return false, err
+	}
+	// --- END OF HEADLESS LOGIC ---
+
 	// A) Sync Service
 	hubSvc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: npr.Name, Namespace: npr.Namespace}}
 	var svcPorts []corev1.ServicePort
@@ -147,17 +180,23 @@ func (r *NodePortReflectorReconciler) syncHubResources(ctx context.Context, npr 
 		}
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, hubSvc, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, hubSvc, func() error {
 		if hubSvc.Labels == nil {
 			hubSvc.Labels = map[string]string{}
 		}
 		hubSvc.Labels["app.kubernetes.io/managed-by"] = "hcp-nodeport-reflector"
 		hubSvc.Spec.Type = corev1.ServiceTypeClusterIP
+
+		// Apply Headless configuration if requested
+		if npr.Spec.Headless {
+			hubSvc.Spec.ClusterIP = corev1.ClusterIPNone
+		}
+
 		hubSvc.Spec.Ports = svcPorts
 		return controllerutil.SetControllerReference(npr, hubSvc, r.Scheme)
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// B) Sync EndpointSlice
@@ -197,7 +236,7 @@ func (r *NodePortReflectorReconciler) syncHubResources(ctx context.Context, npr 
 		return controllerutil.SetControllerReference(npr, expectedSlice, r.Scheme)
 	})
 
-	return err
+	return false, err
 }
 
 func (r *NodePortReflectorReconciler) getActiveNodeIPs(ctx context.Context, hostedClient kubernetes.Interface, namespace, serviceName, mode string) ([]string, error) {

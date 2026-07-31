@@ -50,11 +50,16 @@ spec:
           metadata:
             type: object
           spec:
-            description: NodePortReflectorSpec define el estado deseado
+            description: NodePortReflectorSpec defines the desired state of NodePortReflector.
             properties:
+              headless:
+                default: false
+                description: 'Headless determines if the created shadow service should
+                  be Headless (ClusterIP: None).'
+                type: boolean
               hostedCluster:
-                description: HostedCluster apunta al clúster remoto (nombre del clúster
-                  y namespace del secret)
+                description: HostedCluster points to the remote cluster (cluster name
+                  and secret namespace).
                 properties:
                   name:
                     type: string
@@ -64,8 +69,8 @@ spec:
                 - name
                 type: object
               targetService:
-                description: TargetService apunta al NodePort Service en el clúster
-                  Hosted
+                description: TargetService points to the NodePort Service in the Hosted
+                  cluster.
                 properties:
                   name:
                     type: string
@@ -79,7 +84,7 @@ spec:
             - targetService
             type: object
           status:
-            description: NodePortReflectorStatus define el estado observado del reflector
+            description: NodePortReflectorStatus defines the observed state of NodePortReflector.
             properties:
               activeNodes:
                 type: integer
@@ -145,8 +150,8 @@ spec:
                 type: string
               syncedPorts:
                 items:
-                  description: PortStatus registra qué puertos se están sincronizando
-                    en el Hub
+                  description: PortStatus records which ports are being synchronized
+                    in the Hub.
                   properties:
                     name:
                       type: string

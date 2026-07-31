@@ -5,23 +5,28 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// NamespacedRef define una referencia a un recurso en un namespace específico
+// NamespacedRef defines a reference to a resource in a specific namespace.
 type NamespacedRef struct {
 	Name string `json:"name"`
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 }
 
-// NodePortReflectorSpec define el estado deseado
+// NodePortReflectorSpec defines the desired state of NodePortReflector.
 type NodePortReflectorSpec struct {
-	// HostedCluster apunta al clúster remoto (nombre del clúster y namespace del secret)
+	// HostedCluster points to the remote cluster (cluster name and secret namespace).
 	HostedCluster NamespacedRef `json:"hostedCluster"`
 
-	// TargetService apunta al NodePort Service en el clúster Hosted
+	// TargetService points to the NodePort Service in the Hosted cluster.
 	TargetService NamespacedRef `json:"targetService"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Headless determines if the created shadow service should be Headless (ClusterIP: None).
+	Headless bool `json:"headless,omitempty"`
 }
 
-// PortStatus registra qué puertos se están sincronizando en el Hub
+// PortStatus records which ports are being synchronized in the Hub.
 type PortStatus struct {
 	Name     string `json:"name,omitempty"`
 	Port     int32  `json:"port"`
@@ -29,7 +34,7 @@ type PortStatus struct {
 	Protocol string `json:"protocol"`
 }
 
-// NodePortReflectorStatus define el estado observado del reflector
+// NodePortReflectorStatus defines the observed state of NodePortReflector.
 type NodePortReflectorStatus struct {
 	Phase          string             `json:"phase,omitempty"`
 	DetectedPolicy string             `json:"detectedPolicy,omitempty"`
@@ -56,6 +61,7 @@ type NodePortReflector struct {
 
 // +kubebuilder:object:root=true
 
+// NodePortReflectorList contains a list of NodePortReflector
 type NodePortReflectorList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
