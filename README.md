@@ -11,6 +11,7 @@ When you deploy a `NodePortReflector` Custom Resource in the Hub cluster, the op
 *   **Zero-SNAT IP Preservation:** It intelligently reads the remote service's `externalTrafficPolicy`. If set to `Local`, the operator maps endpoints exclusively to the nodes actively running the pods, preserving the original client IP across cluster boundaries.
 *   **Multi-Port Sync:** Automatically discovers and reflects all exposed ports from the remote service.
 *   **Dynamic Synchronization:** Continuously monitors the Hosted Cluster to update the Hub's endpoints if worker nodes scale up/down or if the remote service changes.
+*   **Headless Service Support:** Optionally configure the shadow service as Headless (`ClusterIP: None`) to bypass the Hub's kube-proxy and allow DNS to return the raw target node IPs directly.
 *   **Ingress Chaining:** Enables advanced multi-tier routing (e.g., exposing a Hosted Cluster's Ingress controller through the Hub's Ingress controller using Passthrough routes).
 
 ---
@@ -59,6 +60,7 @@ metadata:
   name: reflect-my-backend
   namespace: default
 spec:
+  # headless: true               # Optional: Set to true to create a Headless Service (ClusterIP: None)
   hostedCluster:
     name: my-hosted-cluster-name # The name of the HyperShift HostedCluster
     namespace: clusters          # The namespace where the HostedCluster resides in the Hub
@@ -66,6 +68,8 @@ spec:
     name: my-backend-app         # The name of the Service inside the Hosted Cluster
     namespace: default           # The namespace of the Service inside the Hosted Cluster
 ```
+**Note on Headless Services**: If your architecture requires client applications to handle their own load balancing or directly address the underlying node IPs via DNS, you can set `headless: true`. This instructs the operator to provision the shadow service with `ClusterIP: None`.
+
 Once applied, you can verify the status:
 
 ```bash
