@@ -303,7 +303,7 @@ func (r *NodePortReflectorReconciler) updateStatus(ctx context.Context, npr *ref
 	}
 	npr.Status.ActiveNodes = activeNodes
 
-	var syncedPorts []reflectorv1alpha1.PortStatus
+	syncedPorts := make([]reflectorv1alpha1.PortStatus, 0, len(ports))
 	for _, p := range ports {
 		syncedPorts = append(syncedPorts, reflectorv1alpha1.PortStatus{
 			Name:     p.Name,
